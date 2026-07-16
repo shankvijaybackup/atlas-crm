@@ -16,7 +16,8 @@ node server.js          # serves on :8791 (or $PORT)
 | GET | `/` | Employee CRM UI (region switcher, accounts, KPIs) |
 | GET | `/control` | Operator panel to break/restore regions |
 | GET | `/api/health` | Overall health (503 if any region down); `?region=APAC` per-region |
-| GET | `/api/accounts?region=APAC` | Account data, or 503 when that region is down |
+| GET | `/api/accounts?region=APAC` | Account data (stays available during an auth outage) |
+| GET | `/api/activity?region=APAC` | Live sign-in activity feed (successes, or accumulating failures) |
 | POST | `/api/control/break` | `{ "region": "APAC" \| "all" }` (needs `x-control-token`) |
 | POST | `/api/control/restore` | `{ "region": "APAC" \| "all" }` |
 

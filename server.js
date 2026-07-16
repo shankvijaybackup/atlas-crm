@@ -1,22 +1,29 @@
 // Atlas CRM - internal customer platform (demo). Single-file Node HTTP server,
-// no dependencies. Employees across APAC / EMEA / Americas use it. A region can
-// be "broken" on demand: employees there see errors, /healthz flips to 503, and
-// that is what monitoring watches to open a Major Incident.
+// no dependencies. Employees across APAC / EMEA / Americas sign in and work.
+//
+// Outage model (realistic): breaking a region takes down that region's SIGN-IN
+// / auth path. Account DATA keeps loading (existing sessions are fine). New
+// sign-ins start failing one user at a time with clustered errors; the failures
+// accumulate, and only after a pattern builds does the app escalate to
+// "incident raised". Monitoring watches /api/health (the auth path), so the
+// GCP uptime check trips and opens a Major Incident in Atomicwork.
 //
 // Endpoints:
-//   GET  /                      employee CRM UI (region switcher, accounts)
-//   GET  /control               operator panel to break/restore regions
-//   GET  /api/health               overall health (503 if ANY region down)
-//   GET  /api/health?region=APAC   per-region health (200/503)
-//   GET  /api/accounts?region=  account data, or 503 when that region is down
-//   POST /api/control/break     {region|"all"}  (needs x-control-token)
-//   POST /api/control/restore   {region|"all"}
+//   GET  /                        employee CRM UI (accounts + live sign-in feed)
+//   GET  /control                 operator panel to break/restore regions
+//   GET  /api/health              auth health (503 if any region's sign-in down); ?region=APAC per-region
+//   GET  /api/accounts?region=    account data (stays available during an auth outage)
+//   GET  /api/activity?region=    live sign-in activity feed (successes, or accumulating failures)
+//   POST /api/control/break       {region|"all"}  (needs x-control-token)  -> simulate auth outage
+//   POST /api/control/restore     {region|"all"}
 //
-// State is in-memory, so run a single instance on Cloud Run (min=max=1).
+// State is in-memory; run a single instance (Cloud Run --min/max-instances 1).
 
 const http = require("http");
 const PORT = process.env.PORT || 8791;
 const CONTROL_TOKEN = process.env.CONTROL_TOKEN || "atlas-demo-2026";
+const FAIL_INTERVAL_MS = 7000;   // a new user hits a sign-in error ~every 7s
+const ESCALATE_AFTER = 3;        // failures before the app raises an incident banner
 
 const REGIONS = {
   APAC: { label: "APAC", hub: "Singapore", users: 1840,
@@ -26,6 +33,10 @@ const REGIONS = {
       ["Harbour Freight AU", "Sydney", "Mid-Market", "Active", 155000],
       ["Batik Retail Group", "Jakarta", "Mid-Market", "At risk", 98000],
       ["Kai Semiconductors", "Taipei", "Enterprise", "Active", 720000],
+    ],
+    staff: [
+      ["Ananya Gupta", "Singapore"], ["Wei Chen", "Tokyo"], ["Priya Nair", "Bengaluru"],
+      ["Hiroshi Tanaka", "Osaka"], ["Mei Lin", "Taipei"], ["Arjun Rao", "Sydney"], ["Sofia Reyes", "Manila"],
     ] },
   EMEA: { label: "EMEA", hub: "Paris", users: 2610,
     accounts: [
@@ -34,6 +45,10 @@ const REGIONS = {
       ["Bavaria Autowerk", "Munich", "Enterprise", "Active", 1250000],
       ["Nordvik Energy", "Oslo", "Mid-Market", "Active", 210000],
       ["Iberia Fresh", "Madrid", "Mid-Market", "At risk", 74000],
+    ],
+    staff: [
+      ["Lucas Martin", "Paris"], ["Emma Schmidt", "Munich"], ["Oliver Brown", "London"],
+      ["Sofia Rossi", "Milan"], ["Nils Andersen", "Oslo"], ["Aisha Khan", "Dubai"],
     ] },
   AMER: { label: "Americas", hub: "New York", users: 2190,
     accounts: [
@@ -42,15 +57,36 @@ const REGIONS = {
       ["Prairie Foods", "Chicago", "Mid-Market", "Active", 168000],
       ["Andes Telecom", "Sao Paulo", "Enterprise", "At risk", 305000],
       ["Maple Freight", "Toronto", "Mid-Market", "Active", 142000],
+    ],
+    staff: [
+      ["Michael Johnson", "New York"], ["Emily Davis", "San Francisco"], ["Carlos Silva", "Sao Paulo"],
+      ["Jessica Wong", "Toronto"], ["David Miller", "Chicago"], ["Laura Gomez", "Mexico City"],
     ] },
 };
 
-const broken = new Set(); // region keys currently "down"
+// Clustered errors: same root cause (regional auth/identity path down), each
+// user sees a slightly different but nearby failure.
+const SIGNIN_ERRORS = [
+  "Sign-in failed: identity service timed out (HTTP 504)",
+  "Sign-in failed: SSO token exchange error (HTTP 502)",
+  "Sign-in failed: session store unreachable (connection reset)",
+  "Sign-in failed: auth gateway returned 503 upstream",
+  "Sign-in failed: SAML assertion validation timed out",
+  "Sign-in failed: could not reach account service (ETIMEDOUT)",
+  "Sign-in failed: MFA challenge could not be delivered",
+];
 
-function fmtMoney(n) { return "$" + n.toLocaleString("en-US"); }
+const broken = new Set();       // regions whose sign-in path is down
+const brokenSince = {};         // region -> epoch ms when it went down
+
 function json(res, code, obj) {
   res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   res.end(JSON.stringify(obj));
+}
+function hhmmss(ts) {
+  const d = new Date(ts);
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + " UTC";
 }
 
 function healthPayload(region) {
@@ -65,8 +101,45 @@ function healthPayload(region) {
   return { ok, regions, checked_at: new Date().toISOString() };
 }
 
-// ── UI ───────────────────────────────────────────────────────────────────────
-function page(body, extraHead) {
+// Deterministic, time-based sign-in feed. Healthy -> recent successes.
+// Down -> failures accrue one user at a time since brokenSince, newest first.
+function activityPayload(region) {
+  const r = REGIONS[region];
+  if (!r) return { error: "unknown region" };
+  const staff = r.staff;
+  const now = Date.now();
+  const events = [];
+
+  if (!broken.has(region)) {
+    for (let i = 0; i < Math.min(6, staff.length); i++) {
+      events.push({ ts: now - (i * 11000 + 4000), user: staff[i][0], city: staff[i][1], status: "ok", detail: "Signed in" });
+    }
+    return { region, state: "healthy", failures: 0, escalate_after: ESCALATE_AFTER, escalated: false, events };
+  }
+
+  const since = brokenSince[region] || now;
+  const elapsed = now - since;
+  const steps = Math.floor(elapsed / FAIL_INTERVAL_MS) + 1;   // how many sign-in attempts have failed so far
+  const fails = [];
+  for (let i = 0; i < steps; i++) {
+    const u = staff[i % staff.length];
+    const retry = i >= staff.length;
+    const err = SIGNIN_ERRORS[i % SIGNIN_ERRORS.length];
+    fails.push({
+      ts: since + i * FAIL_INTERVAL_MS,
+      user: u[0], city: u[1], status: "failed",
+      detail: err + (retry ? " (retry)" : ""),
+    });
+  }
+  fails.reverse(); // newest first
+  return {
+    region, state: "degraded", failures: fails.length, escalate_after: ESCALATE_AFTER,
+    escalated: fails.length >= ESCALATE_AFTER, since: since, events: fails.slice(0, 12),
+  };
+}
+
+// ── UI shell ──────────────────────────────────────────────────────────────────
+function page(body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Atlas CRM</title>
@@ -82,20 +155,24 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);font-size:14
 .top .logo .dot{width:9px;height:9px;border-radius:50%;background:var(--accent)}
 .top .sub{color:var(--muted);font-size:12px}
 .top .who{margin-left:auto;color:var(--muted);font-size:12px}
-.wrap{max-width:1100px;margin:0 auto;padding:22px}
+.wrap{max-width:1120px;margin:0 auto;padding:22px}
 .tabs{display:flex;gap:6px;margin-bottom:18px}
 .tabs a{padding:6px 14px;border:1px solid var(--border);border-radius:7px;background:var(--surface);
 color:var(--muted);font-weight:600;font-size:13px;text-decoration:none}
 .tabs a.on{background:var(--accent);color:#fff;border-color:var(--accent)}
-.banner{border-radius:9px;padding:12px 16px;margin-bottom:18px;font-weight:600;display:none}
-.banner.show{display:block}
-.banner.down{background:var(--red-bg);color:var(--red);border:1px solid var(--red)}
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.statusbar{display:flex;align-items:center;gap:10px;border-radius:9px;padding:10px 14px;margin-bottom:16px;font-size:13px;font-weight:500;border:1px solid var(--border);background:var(--surface)}
+.statusbar .sdot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+.statusbar.ok .sdot{background:var(--green)} .statusbar.ok{color:var(--green)}
+.statusbar.warn{background:var(--amber-bg);border-color:var(--amber);color:var(--amber)} .statusbar.warn .sdot{background:var(--amber)}
+.statusbar.crit{background:var(--red-bg);border-color:var(--red);color:var(--red)} .statusbar.crit .sdot{background:var(--red)}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
 .kpi{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:14px 16px}
-.kpi .v{font-size:24px;font-weight:800;letter-spacing:-.4px}
+.kpi .v{font-size:22px;font-weight:800;letter-spacing:-.4px}
 .kpi .l{font-size:12px;color:var(--muted);margin-top:2px}
+.grid{display:grid;grid-template-columns:1.15fr 1fr;gap:16px;align-items:start}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}
-.card h3{font-size:13px;font-weight:700;padding:12px 16px;border-bottom:1px solid var(--border)}
+.card h3{font-size:13px;font-weight:700;padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.card h3 .rt{margin-left:auto;font-weight:500;color:var(--muted);font-size:11px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;padding:9px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;
 color:var(--muted);background:var(--bg);border-bottom:1px solid var(--border)}
@@ -104,25 +181,34 @@ tr:last-child td{border-bottom:none}
 .pill{display:inline-block;padding:2px 9px;border-radius:11px;font-size:11px;font-weight:600}
 .pill.Active{background:var(--green-bg);color:var(--green)}
 .pill.Renewal{background:var(--accent-bg);color:var(--accent)}
-.pill\\[at\\]{}
 .pill.risk{background:var(--amber-bg);color:var(--amber)}
-.err{padding:34px 16px;text-align:center;color:var(--red);font-weight:600}
-.err small{display:block;color:var(--muted);font-weight:400;margin-top:6px}
 .regsel{margin-left:auto;display:flex;gap:6px;align-items:center}
 .regsel select{font-family:inherit;font-size:13px;padding:5px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface)}
+/* sign-in feed */
+.feed{max-height:360px;overflow-y:auto}
+.evt{display:flex;align-items:flex-start;gap:10px;padding:9px 16px;border-bottom:1px solid var(--border)}
+.evt:last-child{border-bottom:none}
+.av{width:26px;height:26px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;background:var(--accent)}
+.evt.fail .av{background:var(--red)}
+.evt .who2{font-weight:600}
+.evt .meta{font-size:11px;color:var(--muted)}
+.evt .detail{font-size:12px;margin-top:2px}
+.evt.fail .detail{color:var(--red)}
+.evt .st{margin-left:auto;font-size:11px;font-weight:600;white-space:nowrap}
+.evt.ok .st{color:var(--green)} .evt.fail .st{color:var(--red)}
 .controls{display:flex;flex-direction:column;gap:10px}
 .crow{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:14px 16px;display:flex;align-items:center;gap:14px}
 .crow .rl{font-weight:700;min-width:120px}
-.crow .st{font-size:12px;font-weight:600;padding:2px 10px;border-radius:11px}
-.crow .st.up{background:var(--green-bg);color:var(--green)}
-.crow .st.dn{background:var(--red-bg);color:var(--red)}
+.crow .stt{font-size:12px;font-weight:600;padding:2px 10px;border-radius:11px}
+.crow .stt.up{background:var(--green-bg);color:var(--green)}
+.crow .stt.dn{background:var(--red-bg);color:var(--red)}
 .crow .sp{margin-left:auto;display:flex;gap:8px}
 button{font-family:inherit;font-size:13px;font-weight:600;padding:7px 14px;border-radius:7px;border:1px solid var(--border);background:var(--surface);cursor:pointer}
 button.break{border-color:var(--red);color:var(--red)}
 button.fix{border-color:var(--green);color:var(--green)}
-button:hover{filter:brightness(.97)}
 .hint{color:var(--muted);font-size:12px;margin-top:8px}
-</style>${extraHead || ""}</head><body>
+@media(max-width:820px){.grid{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}}
+</style></head><body>
 <div class="top"><div class="logo"><span class="dot"></span>Atlas CRM</div>
 <span class="sub">Internal Customer Platform</span>
 <span class="who">Signed in: Priya Nair . Sales Ops</span></div>
@@ -131,52 +217,75 @@ button:hover{filter:brightness(.97)}
 
 function crmPage() {
   const body = `
-<div class="tabs"><a class="on" href="/">Accounts</a><a href="/control">Service status</a></div>
-<div id="banner" class="banner down"></div>
+<div class="tabs"><a class="on" href="/">Workspace</a><a href="/control">Service status</a></div>
+<div class="statusbar ok" id="statusbar"><span class="sdot"></span><span id="statustext">Checking sign-in health...</span>
+  <span class="regsel">Region
+    <select id="reg" onchange="switchRegion()">
+      <option value="APAC">APAC</option><option value="EMEA">EMEA</option><option value="AMER">Americas</option>
+    </select></span></div>
 <div class="kpis">
   <div class="kpi"><div class="v" id="k-acc">--</div><div class="l">Accounts in region</div></div>
   <div class="kpi"><div class="v" id="k-arr">--</div><div class="l">Total ARR</div></div>
   <div class="kpi"><div class="v" id="k-usr">--</div><div class="l">Active users</div></div>
   <div class="kpi"><div class="v" id="k-risk">--</div><div class="l">At-risk accounts</div></div>
 </div>
-<div class="card">
-  <h3 style="display:flex;align-items:center">Accounts
-    <span class="regsel">Region
-      <select id="reg" onchange="load()">
-        <option value="APAC">APAC</option><option value="EMEA">EMEA</option><option value="AMER">Americas</option>
-      </select></span></h3>
-  <div id="tbl"></div>
+<div class="grid">
+  <div class="card">
+    <h3>Accounts</h3>
+    <div id="tbl"></div>
+  </div>
+  <div class="card">
+    <h3>Sign-in activity <span class="rt" id="feedrt">live</span></h3>
+    <div class="feed" id="feed"></div>
+  </div>
 </div>
 <script>
-async function load(){
-  var reg=document.getElementById('reg').value;
-  var tbl=document.getElementById('tbl'), ban=document.getElementById('banner');
-  tbl.innerHTML='<div class="err" style="color:var(--muted)">Loading...</div>';
+function reg(){return document.getElementById('reg').value;}
+function initials(n){return n.split(' ').map(function(w){return w[0]}).slice(0,2).join('');}
+
+async function loadAccounts(){
+  var tbl=document.getElementById('tbl');
   try{
-    var r=await fetch('/api/accounts?region='+reg,{cache:'no-store'});
-    if(!r.ok){ throw new Error('HTTP '+r.status); }
+    var r=await fetch('/api/accounts?region='+reg(),{cache:'no-store'});
     var d=await r.json();
-    ban.className='banner';
     document.getElementById('k-acc').textContent=d.accounts.length;
-    document.getElementById('k-arr').textContent='$'+(d.arr).toLocaleString('en-US');
+    document.getElementById('k-arr').textContent='$'+d.arr.toLocaleString('en-US');
     document.getElementById('k-usr').textContent=d.users.toLocaleString('en-US');
     document.getElementById('k-risk').textContent=d.accounts.filter(function(a){return a[3]==='At risk'}).length;
-    var rows=d.accounts.map(function(a){
-      var cls=a[3]==='At risk'?'risk':a[3];
-      return '<tr><td><strong>'+a[0]+'</strong></td><td>'+a[1]+'</td><td>'+a[2]+'</td>'+
-        '<td><span class="pill '+cls+'">'+a[3]+'</span></td><td style="text-align:right">$'+a[4].toLocaleString('en-US')+'</td></tr>';
-    }).join('');
-    tbl.innerHTML='<table><thead><tr><th>Account</th><th>City</th><th>Segment</th><th>Status</th><th style="text-align:right">ARR</th></tr></thead><tbody>'+rows+'</tbody></table>';
-  }catch(e){
-    ban.className='banner down show';
-    ban.textContent='Service degraded in '+reg+'. Account data is unavailable. IT has been notified.';
-    document.getElementById('k-acc').textContent='--';document.getElementById('k-arr').textContent='--';
-    document.getElementById('k-usr').textContent='--';document.getElementById('k-risk').textContent='--';
-    tbl.innerHTML='<div class="err">Unable to reach Atlas CRM services for '+reg+'.<small>Error '+e.message+' . Retrying automatically.</small></div>';
-  }
+    tbl.innerHTML='<table><thead><tr><th>Account</th><th>City</th><th>Segment</th><th>Status</th><th style="text-align:right">ARR</th></tr></thead><tbody>'+
+      d.accounts.map(function(a){var c=a[3]==='At risk'?'risk':a[3];
+        return '<tr><td><strong>'+a[0]+'</strong></td><td>'+a[1]+'</td><td>'+a[2]+'</td><td><span class="pill '+c+'">'+a[3]+'</span></td><td style="text-align:right">$'+a[4].toLocaleString('en-US')+'</td></tr>';}).join('')+'</tbody></table>';
+  }catch(e){ tbl.innerHTML='<div style="padding:16px;color:var(--muted)">Could not load accounts.</div>'; }
 }
-load();
-setInterval(load,5000);
+
+async function loadActivity(){
+  var bar=document.getElementById('statusbar'), txt=document.getElementById('statustext'), feed=document.getElementById('feed');
+  try{
+    var r=await fetch('/api/activity?region='+reg(),{cache:'no-store'});
+    var d=await r.json();
+    if(d.state==='healthy'){
+      bar.className='statusbar ok'; txt.textContent='All sign-ins healthy in '+reg();
+    }else if(d.escalated){
+      bar.className='statusbar crit';
+      txt.textContent='Elevated sign-in failures in '+reg()+' — '+d.failures+' users affected. Incident raised, IT investigating.';
+    }else{
+      bar.className='statusbar warn';
+      txt.textContent=d.failures+' user'+(d.failures===1?'':'s')+' reporting sign-in errors in '+reg()+'…';
+    }
+    feed.innerHTML=d.events.map(function(e){
+      var cls=e.status==='ok'?'ok':'fail';
+      var st=e.status==='ok'?'Success':'Failed';
+      return '<div class="evt '+cls+'"><div class="av">'+initials(e.user)+'</div>'+
+        '<div><div class="who2">'+e.user+'</div><div class="meta">'+e.city+' · '+e.ts_label+'</div>'+
+        '<div class="detail">'+e.detail+'</div></div><div class="st">'+st+'</div></div>';
+    }).join('');
+  }catch(e){}
+}
+
+function switchRegion(){ loadAccounts(); loadActivity(); }
+loadAccounts(); loadActivity();
+setInterval(loadActivity, 4000);
+setInterval(loadAccounts, 20000);
 </script>`;
   return page(body);
 }
@@ -185,32 +294,31 @@ function controlPage() {
   const rows = Object.keys(REGIONS).map(k => {
     const up = !broken.has(k);
     return `<div class="crow"><span class="rl">${REGIONS[k].label}</span>
-      <span class="st ${up ? "up" : "dn"}" id="st-${k}">${up ? "Healthy" : "Down"}</span>
+      <span class="stt ${up ? "up" : "dn"}" id="st-${k}">${up ? "Sign-in healthy" : "Sign-in down"}</span>
       <span class="sp">
-        <button class="break" onclick="act('break','${k}')">Break</button>
+        <button class="break" onclick="act('break','${k}')">Simulate outage</button>
         <button class="fix" onclick="act('restore','${k}')">Restore</button>
       </span></div>`;
   }).join("");
   const body = `
-<div class="tabs"><a href="/">Accounts</a><a class="on" href="/control">Service status</a></div>
-<div class="card" style="margin-bottom:16px"><h3>Region health (what monitoring sees)</h3>
+<div class="tabs"><a href="/">Workspace</a><a class="on" href="/control">Service status</a></div>
+<div class="card" style="margin-bottom:16px"><h3>Region sign-in health (what monitoring sees)</h3>
   <div style="padding:14px 16px" id="hz">checking...</div></div>
 <h3 style="font-size:13px;margin-bottom:10px">Operator controls</h3>
 <div class="controls">${rows}
   <div class="crow"><span class="rl">All regions</span><span class="sp" style="margin-left:auto;display:flex;gap:8px">
-    <button class="break" onclick="act('break','all')">Break all</button>
+    <button class="break" onclick="act('break','all')">Simulate all</button>
     <button class="fix" onclick="act('restore','all')">Restore all</button></span></div>
 </div>
-<div class="hint">Breaking a region flips /api/health to 503 for that region. A monitoring uptime check on /api/health opens a Major Incident in Atomicwork.</div>
+<div class="hint">"Simulate outage" takes down a region's sign-in path: new logins start failing (watch the Workspace tab), /api/health flips to 503, and a GCP uptime check opens a Major Incident in Atomicwork.</div>
 <script>
 var TOKEN='${CONTROL_TOKEN}';
 async function refresh(){
   var r=await fetch('/api/health?all=1',{cache:'no-store'}); var d=await r.json();
-  document.getElementById('hz').innerHTML=Object.keys(d.regions).map(function(k){
-    var up=d.regions[k]==='healthy';
-    return '<span style="margin-right:16px"><strong>'+k+'</strong>: <span style="color:'+(up?'var(--green)':'var(--red)')+'">'+d.regions[k]+'</span></span>';
-  }).join('')+' <span style="color:var(--muted);font-size:12px">(overall '+(d.ok?'200':'503')+')</span>';
-  Object.keys(d.regions).forEach(function(k){var el=document.getElementById('st-'+k);if(el){var up=d.regions[k]==='healthy';el.textContent=up?'Healthy':'Down';el.className='st '+(up?'up':'dn');}});
+  document.getElementById('hz').innerHTML=Object.keys(d.regions).map(function(k){var up=d.regions[k]==='healthy';
+    return '<span style="margin-right:16px"><strong>'+k+'</strong>: <span style="color:'+(up?'var(--green)':'var(--red)')+'">'+d.regions[k]+'</span></span>';}).join('')+
+    ' <span style="color:var(--muted);font-size:12px">(overall '+(d.ok?'200':'503')+')</span>';
+  Object.keys(d.regions).forEach(function(k){var el=document.getElementById('st-'+k);if(el){var up=d.regions[k]==='healthy';el.textContent=up?'Sign-in healthy':'Sign-in down';el.className='stt '+(up?'up':'dn');}});
 }
 async function act(op,region){
   await fetch('/api/control/'+op,{method:'POST',headers:{'Content-Type':'application/json','x-control-token':TOKEN},body:JSON.stringify({region:region})});
@@ -226,12 +334,10 @@ const server = http.createServer((req, res) => {
   const u = new URL(req.url, "http://x");
   const path = u.pathname;
 
-  if (path === "/" ) { res.writeHead(200, { "Content-Type": "text/html" }); return res.end(crmPage()); }
+  if (path === "/") { res.writeHead(200, { "Content-Type": "text/html" }); return res.end(crmPage()); }
   if (path === "/control") { res.writeHead(200, { "Content-Type": "text/html" }); return res.end(controlPage()); }
 
   if (path === "/api/health" || path === "/healthz") {
-    // Note: Cloud Run's front end reserves /healthz, so /api/health is the
-    // path monitoring should watch.
     const region = u.searchParams.get("region");
     if (region && !REGIONS[region]) return json(res, 404, { ok: false, error: "unknown region" });
     const p = healthPayload(region);
@@ -240,11 +346,19 @@ const server = http.createServer((req, res) => {
 
   if (path === "/api/accounts") {
     const region = u.searchParams.get("region") || "APAC";
-    if (!REGIONS[region]) return json(res, 404, { error: "unknown region" });
-    if (broken.has(region)) return json(res, 503, { error: "region unavailable", region });
     const r = REGIONS[region];
+    if (!r) return json(res, 404, { error: "unknown region" });
+    // Data stays available during an auth outage (existing sessions/cache).
     const arr = r.accounts.reduce((a, x) => a + x[4], 0);
     return json(res, 200, { region, hub: r.hub, users: r.users, arr, accounts: r.accounts });
+  }
+
+  if (path === "/api/activity") {
+    const region = u.searchParams.get("region") || "APAC";
+    const p = activityPayload(region);
+    if (p.error) return json(res, 404, p);
+    p.events = p.events.map(e => Object.assign(e, { ts_label: hhmmss(e.ts) }));
+    return json(res, 200, p);
   }
 
   if (path === "/api/control/break" || path === "/api/control/restore") {
@@ -255,10 +369,14 @@ const server = http.createServer((req, res) => {
     req.on("data", c => raw += c);
     req.on("end", () => {
       let region = "all";
-      try { region = (JSON.parse(raw || "{}").region) || u.searchParams.get("region") || "all"; }
+      try { region = JSON.parse(raw || "{}").region || u.searchParams.get("region") || "all"; }
       catch (e) { region = u.searchParams.get("region") || "all"; }
       const targets = region === "all" ? Object.keys(REGIONS) : [region];
-      targets.forEach(k => { if (REGIONS[k]) { if (path.endsWith("break")) broken.add(k); else broken.delete(k); } });
+      targets.forEach(k => {
+        if (!REGIONS[k]) return;
+        if (path.endsWith("break")) { if (!broken.has(k)) { broken.add(k); brokenSince[k] = Date.now(); } }
+        else { broken.delete(k); delete brokenSince[k]; }
+      });
       return json(res, 200, { ok: true, action: path.split("/").pop(), broken: [...broken] });
     });
     return;
