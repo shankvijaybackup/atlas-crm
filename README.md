@@ -35,3 +35,6 @@ Note: Cloud Run's front end reserves `/healthz`, so the health path is `/api/hea
 /api/health 503  →  GCP uptime check fails  →  "Atlas CRM Down" alert policy
    →  webhook  →  gateway  →  Major Incident in Atomicwork (atomicgws WS 2387)
 ```
+
+## Localization & demo control
+UI is available in **English / French / German** (switcher in the top bar; sign-in errors, status banners, KPIs and table all translated). A subtle round control (bottom-right) toggles the selected region's sign-in outage for live demos.
