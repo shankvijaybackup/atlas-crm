@@ -5,13 +5,18 @@ set -euo pipefail
 
 PROJECT="${PROJECT:-atomicwork-gcp-demo}"
 REGION="${REGION:-asia-south1}"
-SERVICE="${SERVICE:-atlas-crm}"
+SERVICE="${SERVICE:-atlas-crm-ops}"
 CONTROL_TOKEN="${CONTROL_TOKEN:-atlas-demo-2026}"
+# One-click incident filing on "Simulate all". Key is passed as a Cloud Run env
+# var, never committed. AW_GROUP 7584 = IT Ops.
+AW_API_KEY="${AW_API_KEY:-}"
+AW_GROUP="${AW_GROUP:-7584}"
+AW_WORKSPACE_ID="${AW_WORKSPACE_ID:-2387}"
 
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --min-instances 1 --max-instances 1 \
-  --set-env-vars "CONTROL_TOKEN=${CONTROL_TOKEN}" \
+  --set-env-vars "CONTROL_TOKEN=${CONTROL_TOKEN},AW_API_KEY=${AW_API_KEY},AW_GROUP=${AW_GROUP},AW_WORKSPACE_ID=${AW_WORKSPACE_ID}" \
   --allow-unauthenticated --quiet
 
 URL="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')"

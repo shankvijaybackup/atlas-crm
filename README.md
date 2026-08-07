@@ -13,8 +13,9 @@ node server.js          # serves on :8791 (or $PORT)
 ## Endpoints
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/` | Employee CRM UI (region switcher, accounts, KPIs) |
-| GET | `/control` | Operator panel to break/restore regions |
+| GET | `/` | Employee sign-in page; on success, that user's own dashboard (their region accounts, KPIs). No other-user data. |
+| POST | `/api/login` | `{ "email": "..." }`. Admin emails (`@atomicwork.com`, `vijay*`) route to `/control`; a general user gets a 503 + localized sign-in error while their region is down |
+| GET | `/control` | Operator console: region health, live sign-in feed (all regions), break/restore |
 | GET | `/api/health` | Overall health (503 if any region down); `?region=APAC` per-region |
 | GET | `/api/accounts?region=APAC` | Account data (stays available during an auth outage) |
 | GET | `/api/activity?region=APAC` | Live sign-in activity feed (successes, or accumulating failures) |
@@ -26,9 +27,11 @@ State is in-memory, so run a single instance (Cloud Run `--min-instances 1 --max
 
 ## Deploy (Cloud Run)
 ```bash
-./deploy.sh             # atomicwork-gcp-demo / asia-south1 / service atlas-crm
+./deploy.sh             # atomicwork-gcp-demo / asia-south1 / service atlas-crm-ops
 ```
 Note: Cloud Run's front end reserves `/healthz`, so the health path is `/api/health`.
+Note: `deploy.sh` sets env vars, so export `AW_API_KEY` before running or deploy with
+`--source .` and no `--set-env-vars` so Cloud Run preserves the live incident-filing key.
 
 ## Monitoring → incident chain
 ```
@@ -37,4 +40,8 @@ Note: Cloud Run's front end reserves `/healthz`, so the health path is `/api/hea
 ```
 
 ## Localization & demo control
-UI is available in **English / French / German** (switcher in the top bar; sign-in errors, status banners, KPIs and table all translated). A subtle round control (bottom-right) toggles the selected region's sign-in outage for live demos.
+UI is available in **English / French / German** (switcher in the top bar; sign-in errors, dashboard KPIs and tables all translated). Outages are simulated from the Operator console (`/control`): sign in with an `@atomicwork.com` email or open `/control` directly, then "Simulate outage" (per region) or "Simulate all (sign-in)" (all regions, also files the incident set).
+
+## Demo sign-in accounts
+- General users: `luke@valeo.com`, `lisa@valeo.com` (any password). During an outage they get a real localized sign-in error and nothing else, no other-user data.
+- Admin / operator: any `@atomicwork.com` email (for example `vijay@atomicwork.com`) routes to the operator console.
