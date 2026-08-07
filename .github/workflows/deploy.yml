@@ -1,10 +1,11 @@
 name: deploy
 
-# Every push to main deploys to Cloud Run. The run record this produces is what
-# the alert-to-resolution agent reads to establish the deploy timeline: the
-# failing deploy is the last successful run completed at or before alert onset,
-# and the run before it is the last-good baseline. Diffing those two head SHAs
-# gives the commits that actually went live.
+# Every push to main builds the image and deploys it to Azure Container Apps.
+# The run record this produces is what the Major Incident RCA Coworker reads to
+# establish the deploy timeline: the failing deploy is the last successful run
+# completed at or before alert onset, and the run before it is the last-good
+# baseline. Diffing those two head SHAs gives the commits that actually went
+# live, which is what stops it blaming a PR that has not shipped yet.
 
 on:
   push:
@@ -12,41 +13,48 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-cloud-run
+  group: deploy-atlas-crm
   cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: entra-unlock-rg
+  CONTAINER_APP: atlas-crm-ops
+  REGISTRY: cac1f270567facr
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: Authenticate to Azure
+        uses: azure/login@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Deploy to Cloud Run
+      - name: Build the image
+        # `az acr build` builds in the registry, so the runner needs no Docker.
+        # Tagging with the commit SHA is what makes a deployed revision traceable
+        # back to a commit.
         run: |
-          # --update-env-vars, not --set-env-vars: the live service holds
-          # AW_API_KEY and friends that are not in this repo, and --set would
-          # drop them.
-          gcloud run deploy atlas-crm-ops \
-            --project atomicwork-gcp-demo \
-            --region asia-south1 \
-            --source . \
-            --min-instances 1 --max-instances 1 \
-            --update-env-vars "CONTROL_TOKEN=${{ secrets.CONTROL_TOKEN }}" \
-            --allow-unauthenticated \
-            --quiet
+          az acr build \
+            --registry "$REGISTRY" \
+            --image "atlas-crm-ops:${GITHUB_SHA}" \
+            --image "atlas-crm-ops:latest" \
+            .
+
+      - name: Deploy to Container Apps
+        run: |
+          az containerapp update \
+            --name "$CONTAINER_APP" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "${REGISTRY}.azurecr.io/atlas-crm-ops:${GITHUB_SHA}" \
+            --set-env-vars "DEPLOYED_SHA=${GITHUB_SHA}" \
+            --output none
 
       - name: Report the deployed revision
         run: |
-          gcloud run services describe atlas-crm-ops \
-            --project atomicwork-gcp-demo --region asia-south1 \
-            --format='value(status.latestReadyRevisionName,status.url)'
+          az containerapp show \
+            --name "$CONTAINER_APP" --resource-group "$RESOURCE_GROUP" \
+            --query "{revision:properties.latestReadyRevisionName,url:properties.configuration.ingress.fqdn}" \
+            -o tsv
