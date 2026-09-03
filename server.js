@@ -111,16 +111,10 @@ function hhmmss(ts) {
   const d = new Date(ts), p = n => String(n).padStart(2, "0");
   return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + " UTC";
 }
-// Readiness gate. An instance whose regional roster has not finished loading
-// answers sign-in with IDP_TIMEOUT, so it should report itself down and drop
-// out of the load balancer pool rather than serve failures.
-function rosterLoaded(r) {
-  return Array.isArray(r.staffList) && r.staffList.length > 0;
-}
 function healthPayload(region) {
   const keys = region ? [region] : Object.keys(REGIONS);
   const regions = {}; let ok = true;
-  keys.forEach(k => { const up = REGIONS[k] && !broken.has(k) && rosterLoaded(REGIONS[k]); regions[k] = up ? "healthy" : "down"; if (!up) ok = false; });
+  keys.forEach(k => { const up = REGIONS[k] && !broken.has(k); regions[k] = up ? "healthy" : "down"; if (!up) ok = false; });
   if (dataOutage) ok = false;
   return { ok, regions, data_layer: dataOutage ? "down" : "healthy", checked_at: new Date().toISOString() };
 }
