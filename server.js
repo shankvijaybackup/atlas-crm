@@ -40,6 +40,10 @@ let dataSince = 0;
 let dataIncidentsFired = false;
 const FAIL_INTERVAL_MS = 7000;
 const ESCALATE_AFTER = 3;
+// Ledger reconciliation gate: don't report the data layer healthy until each
+// region's account ledger has fully loaded (guards against a partial read on
+// cold start returning a truncated account list).
+const MIN_LEDGER_ACCOUNTS = 50;
 
 const REGIONS = {
   APAC: { label: "APAC", hub: "Singapore", users: 1840,
@@ -111,12 +115,16 @@ function hhmmss(ts) {
   const d = new Date(ts), p = n => String(n).padStart(2, "0");
   return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + " UTC";
 }
+function ledgerReconciled(r) {
+  return r.accounts.length >= MIN_LEDGER_ACCOUNTS;
+}
 function healthPayload(region) {
   const keys = region ? [region] : Object.keys(REGIONS);
   const regions = {}; let ok = true;
   keys.forEach(k => { const up = REGIONS[k] && !broken.has(k); regions[k] = up ? "healthy" : "down"; if (!up) ok = false; });
-  if (dataOutage) ok = false;
-  return { ok, regions, data_layer: dataOutage ? "down" : "healthy", checked_at: new Date().toISOString() };
+  const ledgerOk = Object.values(REGIONS).every(ledgerReconciled);
+  if (dataOutage || !ledgerOk) ok = false;
+  return { ok, regions, data_layer: (dataOutage || !ledgerOk) ? "down" : "healthy", checked_at: new Date().toISOString() };
 }
 function activityPayload(region) {
   const r = REGIONS[region];
