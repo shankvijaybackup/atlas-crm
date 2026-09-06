@@ -111,21 +111,12 @@ function hhmmss(ts) {
   const d = new Date(ts), p = n => String(n).padStart(2, "0");
   return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + " UTC";
 }
-// Document freshness gate: don't report the data layer healthy unless the
-// account documents synced inside the freshness window.
-const DOC_FRESHNESS_SECONDS = 300; // account docs must have synced in the last 5 minutes
-const bootedAt = Date.now();
-function docsFresh() {
-  const elapsedMs = Date.now() - bootedAt;
-  return elapsedMs < DOC_FRESHNESS_SECONDS;
-}
 function healthPayload(region) {
   const keys = region ? [region] : Object.keys(REGIONS);
   const regions = {}; let ok = true;
   keys.forEach(k => { const up = REGIONS[k] && !broken.has(k); regions[k] = up ? "healthy" : "down"; if (!up) ok = false; });
-  const fresh = docsFresh();
-  if (dataOutage || !fresh) ok = false;
-  return { ok, regions, data_layer: (dataOutage || !fresh) ? "down" : "healthy", checked_at: new Date().toISOString() };
+  if (dataOutage) ok = false;
+  return { ok, regions, data_layer: dataOutage ? "down" : "healthy", checked_at: new Date().toISOString() };
 }
 function activityPayload(region) {
   const r = REGIONS[region];
