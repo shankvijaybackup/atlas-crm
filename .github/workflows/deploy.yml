@@ -1,11 +1,11 @@
 name: deploy
 
-# Every push to main deploys to Cloud Run. The run record this produces is what
-# the Major Incident RCA Coworker reads to establish the deploy timeline: the
-# failing deploy is the last successful run completed at or before alert onset,
-# and the run before it is the last-good baseline. Diffing those two head SHAs
-# gives the commits that actually went live, which is what stops it blaming a
-# PR that has not shipped yet.
+# Every push to main deploys to Cloud Run. The Datadog deploy event the last
+# step posts is what the RCA Coworker reads to establish the deploy timeline:
+# the failing deploy is the last deploy completed at or before alert onset,
+# and the deploy before it is the last-good baseline. Diffing those two head
+# SHAs gives the commits that actually went live, which is what stops it
+# blaming a PR that has not shipped yet.
 
 on:
   push:
@@ -29,6 +29,8 @@ jobs:
       id-token: write      # required to mint the OIDC token for WIF
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD^1 too, for the deploy event's first-parent diff
 
       - name: Authenticate to Google Cloud
         # Workload Identity Federation, not a service account key. The org
@@ -42,6 +44,7 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy to Cloud Run
+        id: deploy
         # --update-env-vars, not --set-env-vars: the live service holds
         # AW_API_KEY and friends that are not in this repo, and --set would
         # drop them, which silently disables the incident cluster.
@@ -51,9 +54,105 @@ jobs:
             --min-instances 1 --max-instances 1 \
             --update-env-vars "CONTROL_TOKEN=${{ secrets.CONTROL_TOKEN }},DEPLOYED_SHA=${GITHUB_SHA}" \
             --quiet
+          # gcloud returns once the new revision serves all traffic. The deploy
+          # event reports this stamp as the completion time.
+          echo "completed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Report the deployed revision
         run: |
           gcloud run services describe "$SERVICE" \
             --project "$PROJECT" --region "$REGION" \
             --format="value(status.latestReadyRevisionName,status.url)"
+
+      - name: Record the deploy in Datadog
+        # The RCA Coworker reads deploy history from these events: it cannot
+        # see this repo's Actions runs. One event per deploy, posted once the
+        # revision serves, read with dd_search_events query
+        # "deploy:atlas-crm-ops". Keyed on the deploy step alone so a shipped
+        # deploy is always recorded, and best effort so it never fails one.
+        if: always() && steps.deploy.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DEPLOY_COMPLETED: ${{ steps.deploy.outputs.completed }}
+        run: |
+          # Stamped by the deploy step the moment gcloud returned. The fallback,
+          # this step's start, is only a few seconds later.
+          completed="${DEPLOY_COMPLETED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+          if [ -z "${DD_API_KEY:-}" ]; then
+            echo "::notice title=Deploy event skipped::DD_API_KEY is not set, so this deploy is not recorded in Datadog."
+            exit 0
+          fi
+          work="${RUNNER_TEMP:-/tmp}/deploy-event"
+          mkdir -p "$work"
+
+          head_sha="$(git rev-parse HEAD)"
+          subject="$(git log -1 --format=%s HEAD)"
+          run_id="${GITHUB_RUN_ID:-unknown}"
+          # First-parent diff of what shipped. It goes to a file and jq cuts it:
+          # piping git into head would SIGPIPE git and fail under pipefail.
+          parent="$(git rev-parse --verify --quiet 'HEAD^1')" || parent="unknown"
+          if [ "$parent" = "unknown" ] ||
+             ! git diff -U12 "$parent" HEAD -- . ':(exclude)*.md' > "$work/diff"; then
+            echo "[diff unavailable]" > "$work/diff"
+          fi
+
+          revision="$(gcloud run services describe "$SERVICE" \
+            --project "$PROJECT" --region "$REGION" \
+            --format="value(status.latestReadyRevisionName)")" || revision=""
+          [ -n "$revision" ] || revision="unknown"
+
+          # Datadog caps event text at 4000 characters. The whole text stays
+          # within 3900 counted in UTF-8 bytes, so the cap holds however
+          # Datadog counts, and the diff is cut on a line boundary.
+          jq -n \
+            --arg service "$SERVICE" --arg completed "$completed" \
+            --arg run_id "$run_id" --arg attempt "${GITHUB_RUN_ATTEMPT:-1}" \
+            --arg head "$head_sha" --arg parent "$parent" \
+            --arg revision "$revision" --arg subject "$subject" \
+            --rawfile diff "$work/diff" '
+            3900 as $cap | "[diff truncated]" as $marker
+            | ([ "Deploy completed \($completed)",
+                 "run_id \($run_id) (attempt \($attempt))",
+                 "head \($head)",
+                 "parent \($parent)",
+                 "revision \($revision)",
+                 "commit: \($subject[0:300])",
+                 "", "" ] | join("\n")) as $header
+            | (if ($header + $diff | utf8bytelength) <= $cap then $diff
+               else reduce ($diff | split("\n") | .[]) as $line (
+                   {kept: "", room: ($cap - ($header + $marker | utf8bytelength))};
+                   ($line | utf8bytelength + 1) as $n
+                   | if .room >= $n then .kept += $line + "\n" | .room -= $n
+                     else .room = -1 end)
+                 | .kept + $marker
+               end) as $body
+            | {title: "Deploy \($service) \($head[0:7]) completed (run \($run_id))",
+               text: ($header + $body),
+               tags: ["deploy:\($service)", "service:\($service)", "env:demo",
+                      "git_sha:\($head)", "run_id:\($run_id)"],
+               alert_type: "info",
+               source_type_name: "github",
+               aggregation_key: "deploy-\($service)-\($run_id)-\($attempt)"}' > "$work/event.json"
+          jq -r '.title, (.text | split("\n")[0:6][]), "text: \(.text | length) chars"' "$work/event.json"
+
+          # The key reaches curl as a header file, never on its command line.
+          code="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
+            --max-time 20 --retry 2 \
+            -X POST "https://api.ap2.datadoghq.com/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H @<(printf 'DD-API-KEY: %s\n' "$DD_API_KEY") \
+            --data-binary @- < "$work/event.json")" || true
+          case "$code" in
+            2??)
+              echo "Recorded in Datadog: $(jq -r '.event.url // .event.id // empty' "$work/response.json" 2>/dev/null || true) (HTTP $code)"
+              ;;
+            *)
+              echo "::warning title=Deploy event not recorded::Datadog events API returned HTTP ${code:-000}. The deploy itself succeeded."
+              head -c 400 "$work/response.json" 2>/dev/null || true
+              echo
+              exit 1
+              ;;
+          esac
