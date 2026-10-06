@@ -134,7 +134,6 @@ jobs:
                tags: ["deploy:\($service)", "service:\($service)", "env:demo",
                       "git_sha:\($head)", "run_id:\($run_id)"],
                alert_type: "info",
-               source_type_name: "github",
                aggregation_key: "deploy-\($service)-\($run_id)-\($attempt)"}' > "$work/event.json"
           jq -r '.title, (.text | split("\n")[0:6][]), "text: \(.text | length) chars"' "$work/event.json"
 
